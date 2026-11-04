@@ -1,0 +1,25 @@
+# Java / Maven
+target/
+*.class
+*.log
+
+# IntelliJ
+.idea/
+*.iml
+out/
+
+# Node / frontend
+node_modules/
+dist/
+test-results/
+playwright-report/
+coverage/
+
+# Secrets — never commit
+.env
+.env.local
+*.local.txt
+
+# OS
+.DS_Store
+Thumbs.db
