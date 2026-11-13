@@ -1,0 +1,68 @@
+name: auramart
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:                                   # CHANGED — values come from infra/.env
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # CHANGED — $$ = the container's shell reads the variable, not Compose
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s        # check every 5 s
+      timeout: 3s         # a check fails if it takes longer than 3 s
+      retries: 10         # mark unhealthy after 10 failures in a row
+
+  mysql:                                           # orders, auth, payment
+    image: mysql:8.4
+    environment:                                   # CHANGED — values come from infra/.env
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # CHANGED — CMD → CMD-SHELL so the shell can expand the variable
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mongodb:                                         # notification log
+    image: mongo:8.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:                                           # cache, cart, rate limits
+    image: redis:7.4
+    command: ["redis-server", "--appendonly", "yes"]   # save data to disk too
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:
+  mysql-data:
+  mongo-data:
+  redis-data:
