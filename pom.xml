@@ -22,6 +22,7 @@
     <!-- (C) Every service is listed here -->
     <modules>
         <module>common-lib</module>
+        <module>catalog-service</module>
     </modules>
 
     <!-- (D) One place for all versions -->
