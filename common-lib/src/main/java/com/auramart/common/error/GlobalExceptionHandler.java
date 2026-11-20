@@ -8,6 +8,7 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
  * Turns exceptions into RFC 9457 problem responses, the same shape in every service.
@@ -30,6 +31,23 @@ public class GlobalExceptionHandler {
         Map<String, String> errors = new LinkedHashMap<>();
         ex.getBindingResult().getFieldErrors().forEach(error ->
                 errors.putIfAbsent(error.getField(), error.getDefaultMessage()));
+
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                HttpStatus.BAD_REQUEST, "One or more fields are invalid.");
+        problem.setType(URI.create(PROBLEM_BASE + "validation-error"));
+        problem.setTitle("Validation failed");
+        problem.setProperty("errors", errors);
+        return problem;
+    }
+
+    /**
+     * A path or query value that cannot be converted, such as "not-a-uuid" for a UUID id.
+     * Without this handler Spring answers 400 in its own format, not ours.
+     */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ProblemDetail handleTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        String expected = ex.getRequiredType() == null ? "a valid value" : ex.getRequiredType().getSimpleName();
+        Map<String, String> errors = Map.of(ex.getName(), "must be a valid " + expected);
 
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(
                 HttpStatus.BAD_REQUEST, "One or more fields are invalid.");
