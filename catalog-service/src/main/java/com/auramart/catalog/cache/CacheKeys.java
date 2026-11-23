@@ -13,6 +13,9 @@ import org.springframework.data.domain.Pageable;
  */
 public final class CacheKeys {
 
+    /** Every Redis key this service writes starts with this, so its keys never collide with another service's. */
+    public static final String KEY_PREFIX = "catalog:";
+
     /** One product by id. Also holds "not found" markers for 60 s (step 4.10). */
     public static final String PRODUCT = "product";
     /** One page of the product list (step 4.8). */

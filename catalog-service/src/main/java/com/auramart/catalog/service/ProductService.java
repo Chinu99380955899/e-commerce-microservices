@@ -122,7 +122,7 @@ public class ProductService {
      * One page of active products, optionally filtered by category.
      * The category is normalised the same way it is stored (lower case).
      */
-    @Cacheable(cacheNames = CacheKeys.PRODUCT_LIST,
+    @Cacheable(cacheNames = CacheKeys.PRODUCT_LIST, sync = true,
             key = "T(com.auramart.catalog.cache.CacheKeys).list(#category, #pageable)")
     @Transactional(readOnly = true)
     public PagedResponse<ProductResponse> list(String category, Pageable pageable) {
@@ -136,7 +136,7 @@ public class ProductService {
      * Typo-tolerant name search, best match first. The query must already be checked as not blank.
      * LIKE wildcards typed by the user (% and _) are escaped, so "%" cannot match every product.
      */
-    @Cacheable(cacheNames = CacheKeys.PRODUCT_SEARCH,
+    @Cacheable(cacheNames = CacheKeys.PRODUCT_SEARCH, sync = true,
             key = "T(com.auramart.catalog.cache.CacheKeys).search(#query, #pageable)")
     @Transactional(readOnly = true)
     public PagedResponse<ProductResponse> search(String query, Pageable pageable) {
