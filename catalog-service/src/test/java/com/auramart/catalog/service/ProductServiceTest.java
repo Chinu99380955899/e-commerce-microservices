@@ -42,7 +42,9 @@ class ProductServiceTest {
     @BeforeEach
     void setUp() {
         // The mapper has no dependencies, so a real one is simpler than a mock.
-        service = new ProductService(repository, new ProductMapper());
+        // No Spring here, so no cache proxy: these tests check the business rules only.
+        ProductMapper mapper = new ProductMapper();
+        service = new ProductService(repository, mapper, new ProductLookup(repository, mapper));
     }
 
     @Test

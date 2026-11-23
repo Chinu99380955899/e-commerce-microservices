@@ -34,6 +34,7 @@ flowchart LR
     AI[AI assistant] -->|search, get| CAT
     ORD[Order service] -->|read price and stock| CAT
     CAT --> DB[(catalog_db<br/>PostgreSQL)]
+    CAT -->|cache-aside| RC[(Redis<br/>cache)]
 ```
 
 ---
@@ -46,13 +47,17 @@ flowchart LR
 com.auramart.catalog
 ├── CatalogServiceApplication   starts Spring, scans com.auramart.catalog and com.auramart.common
 ├── controller/ProductController HTTP endpoints under /api/v1/products
-├── service/ProductService       business rules, transactions
+├── service/ProductService       business rules, transactions, cache evictions
+├── service/ProductLookup        cached read of one product (separate bean, see 6.6)
 ├── repository/ProductRepository database queries, written as method names
 ├── domain/Product               the stored row (JPA entity)
 ├── dto/ProductRequest           input shape, with validation rules
 ├── dto/ProductResponse          output shape, hides internal fields
 ├── dto/PagedResponse            page wrapper used by the list endpoint
-└── mapper/ProductMapper         converts between Product and the DTOs
+├── mapper/ProductMapper         converts between Product and the DTOs
+├── cache/CacheKeys              cache names and key builders
+├── config/CacheConfig           Redis cache manager: TTLs, serializers, error handler
+└── config/OpenApiConfig         Swagger / OpenAPI title and version
 ```
 
 Shared code from `common-lib`: `BusinessException`, `GlobalExceptionHandler`, `RequestIdFilter`.
@@ -246,6 +251,8 @@ sequenceDiagram
 
 The lookup is `findByIdAndActiveTrue`, so an inactive product is treated exactly like a missing one. A non-UUID path value never reaches the service: Spring rejects it first, and the handler answers 400 (R13).
 
+The read goes through Redis first (`ProductLookup`, section 6.6). Only a cache miss reaches the database.
+
 ### 6.3 List (`GET`)
 
 ```mermaid
@@ -265,7 +272,7 @@ flowchart TD
 
 **Why the checks are in the controller:** these are HTTP inputs. The service receives a `Pageable` that is already valid.
 
-### 6.4 Update (`PUT /{id}`) 🟡
+### 6.4 Update (`PUT /{id}`) ✅
 
 ```mermaid
 sequenceDiagram
@@ -291,11 +298,73 @@ sequenceDiagram
 - `expectedUpdatedAt` catches a user saving a copy from an old screen.
 - `@Version` catches two requests racing each other in the database.
 
-### 6.5 Delete (`DELETE /{id}`) 🟡
+### 6.5 Delete (`DELETE /{id}`) ✅
 
 Finds an active product, sets `active = false` and `updatedAt = now`, and returns 204. The row is not removed (R8).
 
 After a delete, `GET` returns 404 and the product disappears from lists.
+
+### 6.6 Caching with Redis (Phase 4) 🟡
+
+**What is cached:**
+
+| Cache | Redis key example | Holds | TTL | Removed when |
+|---|---|---|---|---|
+| `product` | `catalog:product::3f2a…` | One `ProductResponse`, or a "not found" marker | 10 min + 0–2 min random; "not found" 60 s | That product is updated or deleted |
+| `productList` | `catalog:productList::bags\|0\|20\|price,asc` | One list page | 10 min + 0–2 min random | Any product is created, updated or deleted |
+| `productSearch` | `catalog:productSearch::hedphones\|0\|20\|none` | One search page | 10 min + 0–2 min random | Any product is created, updated or deleted |
+
+Keys are lower-cased (category and query), so `Bags` and `bags` share one entry.
+
+**Read path (cache-aside):**
+
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant L as ProductLookup (cache proxy)
+    participant R as Redis
+    participant DB as PostgreSQL
+    C->>L: findActive(id)
+    L->>R: GET catalog:product::id
+    alt hit
+        R-->>C: product (or "not found" marker → 404)
+    else miss
+        L->>DB: SELECT … WHERE id = ? AND active
+        L->>R: SET with TTL (10–12 min, or 60 s if not found)
+        L-->>C: product or 404
+    end
+```
+
+**Write path:** `create`, `update` and `delete` commit first, then evict. Update and delete remove `product::id`. All three clear every list and search page, because a change can move a product onto or off any page.
+
+**Design decisions, and why:**
+
+| Decision | Why |
+|---|---|
+| `ProductLookup` is a separate bean | `@Cacheable` works through a Spring proxy. A call from `ProductService` to its own method skips the proxy, so it would never be cached. |
+| It returns `Optional` | `Optional.empty()` is cached as "not found" for 60 s (step 4.10). Repeated requests for ids that do not exist stop hitting the database. |
+| Random 0–2 min added to each TTL | Entries cached together, for example after a deploy, do not all expire in the same second (step 4.8, cache avalanche). |
+| Cache advice runs outside the transaction (`@EnableCaching(order = LOWEST_PRECEDENCE - 1)`) | A hit never borrows a DB connection. The evict happens after the commit, so the next reader sees the new row. |
+| `immediateWrites()` on the cache writer | Spring Data Redis 4 with Lettuce writes **asynchronously** by default. `@CacheEvict` returned before Redis had deleted anything, so the next read could still get the old page, and a slow put could even land after the evict. A test caught it. |
+| `SCAN`, not `KEYS`, to clear a cache | `KEYS` blocks Redis while it walks every key. |
+| One typed JSON serializer per cache | Readable in `redis-cli`, no Java class names stored, and a renamed class cannot break old entries. A hit returns byte-for-byte the same JSON as a database read (checked). |
+| `CacheErrorHandler` logs and carries on | The cache only makes things faster. If Redis is down, requests are answered from the database. |
+| Redis timeouts 500 ms, connect 1 s | A dead Redis fails fast instead of hanging requests. |
+
+**Measured (step 4.4):** p50 of the full HTTP request with `curl` on a laptop. A "miss" deleted the key first; a "hit" repeated the same request.
+
+| Request | 22 products: miss → hit | 1,000,000 products: miss → hit |
+|---|---|---|
+| Get by id | 23 → 4 ms | 20 → 5 ms |
+| List, one category, sorted by price | 25 → 4 ms | 41 → 5 ms |
+| List, all, sorted by name | — | 46 → 5 ms |
+| Search `hedphones` | 23 → 4 ms | **645 → 5 ms** |
+
+About 4–5 ms is the floor of this measurement (starting `curl` plus the HTTP round trip), so every hit is as fast as the tool can show. The 645 ms search miss is two queries: the page, and a `COUNT` with the same `WHERE` (G13).
+
+**Hit rate (step 4.13):** `GET /actuator/metrics/cache.gets?tag=cache:product&tag=result:hit` (and `result:miss`) for each cache. Target in production: above 90%.
+
+**Checked by hand:** with Redis stopped, get by id and search still return 200 from the database, about 1 s slower (G14). After Redis starts again, cached entries are back, because Redis saves to disk (AOF).
 
 ---
 
@@ -306,6 +375,8 @@ After a delete, `GET` returns 404 and the product disappears from lists.
 | Stale screen | Admin A edits from a page loaded 10 minutes ago, after Admin B changed the price | `expectedUpdatedAt` in service | 409, reload and retry |
 | Racing saves | Two requests change the stock at the same instant | `@Version` in database | One succeeds, the other gets 409 |
 | Duplicate creates | Two requests create the same SKU at once | `UNIQUE` on `sku`; `create` flushes inside a try and maps the `products_sku_key` violation | 409 `duplicate-sku`, not a 500 |
+| Stale cache after a write | A product is read from Redis right after it was changed | Evict after commit, and wait for Redis to confirm (`immediateWrites`) | The next read goes to the database and sees the change |
+| Read racing a write | A reader misses, reads the old row, and stores it just after the writer's evict | Not handled yet (G15) | Old data can live in the cache until its TTL ends |
 
 **Precision gotcha:** `expectedUpdatedAt` is compared as an exact instant. Clients must send back the exact string from the last read, not a value they rounded or rebuilt.
 
@@ -368,6 +439,9 @@ A rule is worth more when it is checked more than once. The catalog checks most 
 | `spring.flyway.enabled` | true | Flyway creates and changes the schema |
 | `spring.jpa.hibernate.ddl-auto` | validate | Hibernate checks the schema, never changes it |
 | `spring.jpa.open-in-view` | false | The DB session ends with the service method; no hidden lazy queries |
+| `spring.data.redis.host` / `port` | `${REDIS_HOST:localhost}` / `${REDIS_PORT:6380}` | The Compose Redis is published on **6380**: a Redis installed natively on Windows owns `127.0.0.1:6379` and answered instead of the container |
+| `spring.data.redis.timeout` / `connect-timeout` | 500 ms / 1 s | A slow or dead Redis fails fast; the request falls back to the database |
+| `management.endpoints.web.exposure.include` | `health,info,metrics` | `metrics` shows the cache hit rate; `env` and `beans` stay closed |
 
 **API docs:** Swagger UI at `http://localhost:8082/swagger-ui.html`, OpenAPI JSON at `/v3/api-docs` (springdoc 3.0.3, the line for Spring Boot 4.0).
 
@@ -408,8 +482,9 @@ mvn -pl catalog-service spring-boot:run
 | `ProductServiceTest.getActiveOfAMissingProductIsNotFound` | Unit | Get of a missing product gives `product-not-found` |
 | `CatalogServiceApplicationTests` | Startup | The app starts and all migrations match the entity |
 | `ProductApiIntegrationTest` (11 tests) | Integration, Testcontainers | Real HTTP and real PostgreSQL: create and get, duplicate SKU, validation, bad UUID, stale and fresh update, delete, typo search on name and brand, blank search, bad sort, OpenAPI docs |
+| `ProductCacheIntegrationTest` (6 tests) | Integration, Testcontainers | Real Redis. A row changed directly in the database (behind the cache) still shows the old value, which proves the answer came from Redis; then update, delete and create evict it. Also: TTL 10–12 min with jitter, "not found" TTL ≤ 60 s, a repeated miss counts as a cache hit, list and search pages are cleared on writes |
 
-Run with: `mvn -pl catalog-service -am test`. **Docker must be running**: `TestcontainersConfiguration` starts a throwaway `pgvector/pgvector:pg17` container, so the tests need neither the Compose database nor `POSTGRES_PASSWORD`.
+Run with: `mvn -pl catalog-service -am test`. **Docker must be running**: `TestcontainersConfiguration` starts a throwaway `pgvector/pgvector:pg17` and a `redis:7.4` container, so the tests need neither the Compose containers nor `POSTGRES_PASSWORD`.
 
 **Checked by hand:** the frontend (`npm run dev:real` with `.env.real.local` pointing at 8082) lists real products and finds "Wireless Noise Cancelling Headphones" for `hedphones`.
 
@@ -419,8 +494,6 @@ Run with: `mvn -pl catalog-service -am test`. **Docker must be running**: `Testc
 
 ## 12. Known gaps
 
-| # | Gap | Effect today | Fix |
-|---|---|---|---|
 Fixed: G1 (raced duplicate SKU now 409), G4 (one not-found helper), G6 (search, step 3.8), G7 (Testcontainers tests, 3.10), G8 (Swagger, 3.11), G9 (frontend connected, 3.12), and the index, pool and seed parts of G10 (3.14 to 3.16).
 
 | # | Gap | Effect today | Fix |
@@ -431,14 +504,21 @@ Fixed: G1 (raced duplicate SKU now 409), G4 (one not-found helper), G6 (search, 
 | G10 | No read replica | All reads hit the primary | Step 3.13, after the replica in Compose (step 1.5) |
 | G11 | `catalog-service` parent is Spring's starter, not `auramart-parent` | Versions are not shared with other modules | Align the parent POM |
 | G12 | Short words with a dropped letter miss: `sonra` does not find "Sonora" (score 0.55, threshold 0.6) | Some typos return nothing | Lower `pg_trgm.word_similarity_threshold` for the search, and measure the extra noise |
-| G13 | A search term that matches tens of thousands of rows is slow: `hedphones` takes 286 ms on 1M generated rows | Every match is ranked before the first page is returned | GiST trigram index with `<<->` distance ordering, so Postgres reads only the top matches |
+| G13 | A search term that matches tens of thousands of rows is slow: `hedphones` takes 286 ms per query on 1M generated rows, 645 ms per request (page + count) | The first search for a term is slow; repeats come from the cache in about 5 ms | GiST trigram index with `<<->` distance ordering, so Postgres reads only the top matches; consider an estimated count |
+| G14 | While Redis is down, every request waits for the Redis timeouts (500 ms get + 500 ms put) | About 1 s extra per request; correct answers, but slow under load | Circuit breaker around the cache (Resilience4j), so Redis is skipped after a few failures |
+| G15 | Cache-aside race: a reader that read the old row just before a write commits can store it just after the evict | Rare stale data, up to 12 minutes | Delayed second evict, or versioned entries; step 4.11 (evict on `ProductUpdated` events) narrows it |
+| G16 | An evict that fails while Redis is down is lost, and Redis keeps old entries across a restart (AOF) | After an outage, changes made during it can show old data for up to 12 minutes | Evict from the `ProductUpdated` event with retries (step 4.11), or flush the catalog keys when Redis comes back |
+| G17 | No stampede protection (step 4.9): many requests missing the same key at once all query the database | A popular page expiring under heavy load sends a burst of identical queries | Per-key lock with `SET NX` on a miss; the others wait briefly and read the cache |
 
 ---
 
 ## 13. Next steps, in order
 
-1. Commit and merge steps 3.7 to 3.16 (done in code, tests green).
-2. Step 1.5 then 3.13: a Postgres read replica in Compose, then route `readOnly` transactions to it.
-3. Optional tuning: G12 and G13.
+1. Commit and merge the Redis cache (steps 4.1–4.4, 4.8, 4.10, 4.13; tests green).
+2. Step 4.9: stampede protection with a per-key `SET NX` lock (G17).
+3. Steps 4.5–4.7: product images in S3 with pre-signed URLs, LocalStack for local work. Needs your own AWS free-tier account and an IAM user.
+4. Step 4.12: Caffeine local cache for categories, once there is a categories endpoint.
+5. Step 4.11 waits for Kafka (Phase 7). Step 1.5 then 3.13 (read replica) can be done any time.
+6. Optional tuning: G12 to G16.
 
-After step 2, the catalog service is complete. Each later service follows the same pattern: contract, migration, entity, DTOs, mapper, repository, service, controller, tests, then documentation like this one.
+Each later service follows the same pattern: contract, migration, entity, DTOs, mapper, repository, service, controller, tests, then documentation like this one.

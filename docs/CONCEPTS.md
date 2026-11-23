@@ -67,8 +67,8 @@ flowchart LR
 flowchart TD
     P0[Phase 0 setup ✅] --> P1[Phase 1 infrastructure ✅ partial]
     P1 --> P2[Phase 2 common-lib ✅ mostly]
-    P2 --> P3[Phase 3 catalog ✅ list, create, get · 🟡 update, delete]
-    P3 --> P4[Phase 4 caching and images ⬜]
+    P2 --> P3[Phase 3 catalog ✅ CRUD, search, tests · ⬜ read replica]
+    P3 --> P4[Phase 4 caching 🟡 Redis cache · ⬜ stampede lock, images in S3]
     P4 --> P5[Phase 5 auth and gateway ⬜]
     P5 --> P6[Phase 6 inventory and orders ⬜]
     P6 --> P7[Phase 7 Kafka saga ⬜]
@@ -307,14 +307,45 @@ sequenceDiagram
 | Unit | One class, dependencies faked | JUnit, Mockito | `ProductServiceTest` |
 | Filter | HTTP-level rule without a server | Spring mocks | `RequestIdFilterTest` |
 | Application | The app starts with a real database | Spring Boot test | `CatalogServiceApplicationTests` |
-| Manual | The running service over HTTP | `curl` | list, update, delete checks |
-
-⬜ Integration tests with Testcontainers are planned (step 3.10).
+| Integration | Real HTTP, real PostgreSQL and Redis in throwaway containers | Testcontainers, MockMvc | `ProductApiIntegrationTest`, `ProductCacheIntegrationTest` |
+| Manual | The running service over HTTP | `curl` | timings, Redis stopped, JSON from cache vs database |
 
 ### 3.28 Observability (Actuator) 🟡
-- **What:** `/actuator/health` reports whether the service is up and ready.
-- **Why:** platforms and load balancers use it to restart or hold back traffic.
+- **What:** `/actuator/health` reports whether the service is up and ready. `/actuator/metrics` shows numbers such as `cache.gets` (hits and misses).
+- **Why:** platforms and load balancers use health to restart or hold back traffic; metrics show whether a change actually helped.
 - **Rule:** expose only what you need. `env` and `beans` must stay closed.
+
+### 3.29 Cache-aside with Spring Cache 🟡
+- **What:** read the cache first; on a miss read the database and store the answer. Writes change the database, then remove (evict) the cached copy. `@Cacheable` does the read side, `@CacheEvict` the write side.
+- **Why:** most catalogue traffic is reads of the same products and pages. A Redis hit costs about 5 ms at the HTTP level; a search miss on 1M rows costs 645 ms.
+- **Where:** `ProductLookup.findActive`, `ProductService` (`list`, `search`, `create`, `update`, `delete`), `config/CacheConfig`.
+- **Mistake to avoid:** calling a `@Cacheable` method from the same class. The call does not pass through the Spring proxy, so nothing is cached. That is why `ProductLookup` is its own bean.
+
+### 3.30 TTL and jitter 🟡
+- **What:** every entry expires after a time to live (TTL): here 10 minutes plus a random 0–2 minutes.
+- **Why:** the TTL limits how long stale data can survive if an evict is missed. The random part stops entries written together from expiring together and hitting the database in one burst (a cache **avalanche**).
+- **Where:** `CacheConfig.ttlWithJitter()`.
+
+### 3.31 Negative caching 🟡
+- **What:** "this product does not exist" is cached too, for 60 seconds only.
+- **Why:** without it, requests for ids that do not exist (bots, old links, attacks) always reach the database: cache **penetration**.
+- **Where:** `ProductLookup` returns `Optional`; an empty one is stored as a null marker, and the TTL function gives null values 60 s.
+
+### 3.32 Invalidation and ordering 🟡
+- **What:** evict only after the transaction commits, and wait for Redis to confirm.
+- **Why:** an evict before the commit lets a reader put the old row straight back. An evict that is sent but not confirmed lets the next read still see the old entry.
+- **Where:** `@EnableCaching(order = LOWEST_PRECEDENCE - 1)` puts the cache advice outside the transaction; `immediateWrites()` on the cache writer.
+- **Mistake to avoid:** trusting defaults. Spring Data Redis 4 writes asynchronously by default with Lettuce; a test that changed a product and read it straight back caught it.
+
+### 3.33 The cache must not be a single point of failure 🟡
+- **What:** if Redis fails, log it and answer from the database (`CacheErrorHandler`). Short Redis timeouts keep the fallback quick.
+- **Why:** a cache only makes things faster. Losing it must not make the shop unavailable.
+- **Still missing:** a circuit breaker, so a dead Redis is skipped instead of timing out on every request (gap G14).
+
+### 3.34 Port clashes with locally installed software ✅
+- **What:** a Redis installed natively on Windows listened on `127.0.0.1:6379`. Docker publishes on `0.0.0.0:6379`, and `localhost` reached the native one first, so the app silently used the wrong Redis.
+- **Fix:** publish project containers on unusual host ports (Postgres 5435, Redis 6380).
+- **Check:** `netstat -ano | findstr :6379` shows every process listening on a port.
 
 ---
 
@@ -328,6 +359,9 @@ sequenceDiagram
 | Two concurrency checks | Database race and stale screens are different problems | Only one of them |
 | Manual mapper first | Learn what MapStruct generates | MapStruct from day one |
 | Layer-first packages | Easy to read one feature | Feature-first (we will move when there are many features) |
+| Spring Cache annotations on Redis | Little code, and the cache logic stays out of the business rules | Hand-written `GET`/`SET` calls in every method |
+| Clear all list and search pages on any write | Always correct, and products change rarely | Working out which pages a change affects |
+| Typed JSON per cache | Readable, no class names in Redis | Java serialization, or JSON with `@class` type hints |
 
 ---
 
@@ -342,3 +376,7 @@ sequenceDiagram
 - **MDC:** per-thread context that logs print automatically.
 - **Healthcheck:** a test that proves a service is ready, not just running.
 - **Slug:** the stable, machine-readable code for an error type.
+- **Cache hit / miss:** the answer was / was not already in the cache.
+- **TTL:** time to live; how long a cache entry is kept before it expires.
+- **Evict:** remove one entry from the cache so the next read fetches fresh data.
+- **Avalanche, penetration, stampede:** many entries expiring at once; requests for data that does not exist; many requests missing the same entry at the same moment.
