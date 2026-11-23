@@ -1,9 +1,12 @@
 package com.auramart.catalog.config;
 
 import com.auramart.catalog.cache.CacheKeys;
+import com.auramart.catalog.cache.SingleFlightRedisCache;
+import com.auramart.catalog.cache.SingleFlightRedisCacheManager;
 import com.auramart.catalog.dto.PagedResponse;
 import com.auramart.catalog.dto.ProductResponse;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
@@ -18,13 +21,15 @@ import org.springframework.data.redis.cache.RedisCacheConfiguration;
 import org.springframework.data.redis.cache.RedisCacheManager;
 import org.springframework.data.redis.cache.RedisCacheWriter;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.serializer.JacksonJsonRedisSerializer;
 import org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair;
 import tools.jackson.databind.JavaType;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
- * Steps 4.1-4.3, 4.8, 4.10, 4.13: Redis as the cache behind @Cacheable / @CacheEvict.
+ * Steps 4.1-4.3, 4.8-4.10, 4.13: Redis as the cache behind @Cacheable / @CacheEvict,
+ * with a per-key lock against stampedes (SingleFlightRedisCache).
  *
  * Order: the cache advice runs OUTSIDE the transaction (order just before the transaction advice,
  * which is LOWEST_PRECEDENCE). So a cache hit never borrows a DB connection, and @CacheEvict runs
@@ -42,8 +47,17 @@ public class CacheConfig implements CachingConfigurer {
     /** A "not found" answer is cached briefly: long enough to absorb a flood, short enough to self-heal. */
     static final Duration NOT_FOUND_TTL = Duration.ofSeconds(60);
 
+    /**
+     * Step 4.9. Lock 3 s: the slowest load measured is a 645 ms search on 1M rows, and a crashed pod
+     * blocks a key for at most 3 s. Wait 5 s: longer than the lock, so after a crash the next request
+     * takes over the lock while the rest keep waiting, instead of all of them querying at once.
+     */
+    static final SingleFlightRedisCache.Settings SINGLE_FLIGHT = new SingleFlightRedisCache.Settings(
+            Duration.ofSeconds(3), Duration.ofSeconds(5), Duration.ofMillis(25));
+
     @Bean
-    RedisCacheManager cacheManager(RedisConnectionFactory connectionFactory, JsonMapper jsonMapper) {
+    RedisCacheManager cacheManager(RedisConnectionFactory connectionFactory, JsonMapper jsonMapper,
+            StringRedisTemplate redis) {
         RedisCacheWriter writer = RedisCacheWriter.create(connectionFactory, writerConfig -> writerConfig
                 // SCAN instead of KEYS when a whole cache is cleared: KEYS blocks Redis while it walks every key.
                 .batchStrategy(BatchStrategies.scan(1000))
@@ -56,7 +70,7 @@ public class CacheConfig implements CachingConfigurer {
                 .collectStatistics());
 
         RedisCacheConfiguration defaults = RedisCacheConfiguration.defaultCacheConfig()
-                .computePrefixWith(cacheName -> "catalog:" + cacheName + "::")
+                .computePrefixWith(cacheName -> CacheKeys.KEY_PREFIX + cacheName + "::")
                 .entryTtl(ttlWithJitter());
 
         // Typed JSON per cache: readable in redis-cli, no Java class names stored in Redis,
@@ -70,13 +84,11 @@ public class CacheConfig implements CachingConfigurer {
                 .serializeValuesWith(SerializationPair.fromSerializer(
                         new JacksonJsonRedisSerializer<PagedResponse<ProductResponse>>(jsonMapper, pageType)));
 
-        return RedisCacheManager.builder(writer)
-                .cacheDefaults(defaults)
-                .withCacheConfiguration(CacheKeys.PRODUCT, productCache)
-                .withCacheConfiguration(CacheKeys.PRODUCT_LIST, pageCache)
-                .withCacheConfiguration(CacheKeys.PRODUCT_SEARCH, pageCache)
-                .disableCreateOnMissingCache()   // a typo in a cache name fails loudly, not silently
-                .build();
+        // Only these three names exist: a typo in a cache name fails loudly instead of creating a new cache.
+        return new SingleFlightRedisCacheManager(writer, defaults, Map.of(
+                CacheKeys.PRODUCT, productCache,
+                CacheKeys.PRODUCT_LIST, pageCache,
+                CacheKeys.PRODUCT_SEARCH, pageCache), redis, SINGLE_FLIGHT);
     }
 
     /**

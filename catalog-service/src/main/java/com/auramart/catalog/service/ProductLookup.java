@@ -28,7 +28,8 @@ public class ProductLookup {
     private final ProductRepository repository;
     private final ProductMapper mapper;
 
-    @Cacheable(cacheNames = CacheKeys.PRODUCT, key = "#id")
+    /** sync = true: on a miss, one request loads and the others wait for it (step 4.9). */
+    @Cacheable(cacheNames = CacheKeys.PRODUCT, key = "#id", sync = true)
     @Transactional(readOnly = true)
     public Optional<ProductResponse> findActive(UUID id) {
         return repository.findByIdAndActiveTrue(id).map(mapper::toResponse);

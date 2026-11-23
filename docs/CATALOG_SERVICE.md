@@ -56,6 +56,8 @@ com.auramart.catalog
 ├── dto/PagedResponse            page wrapper used by the list endpoint
 ├── mapper/ProductMapper         converts between Product and the DTOs
 ├── cache/CacheKeys              cache names and key builders
+├── cache/SingleFlightRedisCache one request loads a missing key, the others wait (step 4.9)
+├── cache/SingleFlightRedisCacheManager creates those caches
 ├── config/CacheConfig           Redis cache manager: TTLs, serializers, error handler
 └── config/OpenApiConfig         Swagger / OpenAPI title and version
 ```
@@ -329,11 +331,21 @@ sequenceDiagram
     alt hit
         R-->>C: product (or "not found" marker → 404)
     else miss
-        L->>DB: SELECT … WHERE id = ? AND active
-        L->>R: SET with TTL (10–12 min, or 60 s if not found)
-        L-->>C: product or 404
+        L->>R: SET catalog:lock:product::id token NX PX 3000
+        alt got the lock (first request)
+            L->>DB: SELECT … WHERE id = ? AND active
+            L->>R: SET value with TTL (10–12 min, or 60 s if not found)
+            L->>R: delete the lock, only if it still holds our token
+            L-->>C: product or 404
+        else someone else is loading it
+            L->>R: check the lock every 25 ms until it is gone
+            L->>R: GET catalog:product::id
+            L-->>C: product or 404
+        end
     end
 ```
+
+List and search pages work the same way, with their own keys and locks.
 
 **Write path:** `create`, `update` and `delete` commit first, then evict. Update and delete remove `product::id`. All three clear every list and search page, because a change can move a product onto or off any page.
 
@@ -344,6 +356,10 @@ sequenceDiagram
 | `ProductLookup` is a separate bean | `@Cacheable` works through a Spring proxy. A call from `ProductService` to its own method skips the proxy, so it would never be cached. |
 | It returns `Optional` | `Optional.empty()` is cached as "not found" for 60 s (step 4.10). Repeated requests for ids that do not exist stop hitting the database. |
 | Random 0–2 min added to each TTL | Entries cached together, for example after a deploy, do not all expire in the same second (step 4.8, cache avalanche). |
+| `@Cacheable(sync = true)` with `SingleFlightRedisCache` | Step 4.9, cache stampede: when many requests miss the same key at once, one takes a per-key lock (`SET NX`) and loads it; the rest wait and read what it stored. The lock is in Redis, so this holds across all pods. |
+| Lock expires after 3 s; a waiter gives up after 5 s | A crashed pod blocks a key for at most 3 s, then the next request takes over. After 5 s a waiter queries the database itself: a slow answer beats an error. |
+| Value stored before the lock is released; release checks our token | Whoever sees the lock gone also sees the value. A load slower than 3 s cannot delete a lock that someone else took after ours expired. |
+| A subclass of `RedisCache`, not Spring's built-in `sync` | The built-in path passes a null value to the TTL rule, which would give every entry the 60 s "not found" TTL. Staying a `RedisCache` also keeps Spring Boot's cache metrics. |
 | Cache advice runs outside the transaction (`@EnableCaching(order = LOWEST_PRECEDENCE - 1)`) | A hit never borrows a DB connection. The evict happens after the commit, so the next reader sees the new row. |
 | `immediateWrites()` on the cache writer | Spring Data Redis 4 with Lettuce writes **asynchronously** by default. `@CacheEvict` returned before Redis had deleted anything, so the next read could still get the old page, and a slow put could even land after the evict. A test caught it. |
 | `SCAN`, not `KEYS`, to clear a cache | `KEYS` blocks Redis while it walks every key. |
@@ -364,7 +380,9 @@ About 4–5 ms is the floor of this measurement (starting `curl` plus the HTTP r
 
 **Hit rate (step 4.13):** `GET /actuator/metrics/cache.gets?tag=cache:product&tag=result:hit` (and `result:miss`) for each cache. Target in production: above 90%.
 
-**Checked by hand:** with Redis stopped, get by id and search still return 200 from the database, about 1 s slower (G14). After Redis starts again, cached entries are back, because Redis saves to disk (AOF).
+**Stampede (step 4.9):** 50 identical search requests at the same moment, for a term nobody had searched, on 1,000,000 products: all 50 returned 200, the database was queried **once** (`cache.puts` +1; `cache.gets` 50 misses then 49 hits), and the whole burst took about as long as one search. With the lock switched off in a test run, every request queried the database (20 out of 20).
+
+**Checked by hand:** with Redis stopped, get by id, list and search still return 200 from the database, about 0.5 s slower: one Redis timeout (G14). After Redis starts again, cached entries are back, because Redis saves to disk (AOF).
 
 ---
 
@@ -377,6 +395,7 @@ About 4–5 ms is the floor of this measurement (starting `curl` plus the HTTP r
 | Duplicate creates | Two requests create the same SKU at once | `UNIQUE` on `sku`; `create` flushes inside a try and maps the `products_sku_key` violation | 409 `duplicate-sku`, not a 500 |
 | Stale cache after a write | A product is read from Redis right after it was changed | Evict after commit, and wait for Redis to confirm (`immediateWrites`) | The next read goes to the database and sees the change |
 | Read racing a write | A reader misses, reads the old row, and stores it just after the writer's evict | Not handled yet (G15) | Old data can live in the cache until its TTL ends |
+| Cache stampede | 500 requests miss the same expired entry in one second | Per-key `SET NX` lock in Redis (`SingleFlightRedisCache`) | One database query; the others wait for its result |
 
 **Precision gotcha:** `expectedUpdatedAt` is compared as an exact instant. Clients must send back the exact string from the last read, not a value they rounded or rebuilt.
 
@@ -482,6 +501,7 @@ mvn -pl catalog-service spring-boot:run
 | `ProductServiceTest.getActiveOfAMissingProductIsNotFound` | Unit | Get of a missing product gives `product-not-found` |
 | `CatalogServiceApplicationTests` | Startup | The app starts and all migrations match the entity |
 | `ProductApiIntegrationTest` (11 tests) | Integration, Testcontainers | Real HTTP and real PostgreSQL: create and get, duplicate SKU, validation, bad UUID, stale and fresh update, delete, typo search on name and brand, blank search, bad sort, OpenAPI docs |
+| `SingleFlightRedisCacheTest` (6 tests) | Integration, Testcontainers | 20 concurrent misses run a slow loader once; 20 concurrent `getActive` calls through the real service store the product once; a crashed lock holder only delays the others; a waiter reads the database itself after the maximum wait; a failed load releases the lock; values stored under the lock keep their own TTL. Checked that 4 of the 6 fail when the lock is switched off |
 | `ProductCacheIntegrationTest` (6 tests) | Integration, Testcontainers | Real Redis. A row changed directly in the database (behind the cache) still shows the old value, which proves the answer came from Redis; then update, delete and create evict it. Also: TTL 10–12 min with jitter, "not found" TTL ≤ 60 s, a repeated miss counts as a cache hit, list and search pages are cleared on writes |
 
 Run with: `mvn -pl catalog-service -am test`. **Docker must be running**: `TestcontainersConfiguration` starts a throwaway `pgvector/pgvector:pg17` and a `redis:7.4` container, so the tests need neither the Compose containers nor `POSTGRES_PASSWORD`.
@@ -494,7 +514,7 @@ Run with: `mvn -pl catalog-service -am test`. **Docker must be running**: `Testc
 
 ## 12. Known gaps
 
-Fixed: G1 (raced duplicate SKU now 409), G4 (one not-found helper), G6 (search, step 3.8), G7 (Testcontainers tests, 3.10), G8 (Swagger, 3.11), G9 (frontend connected, 3.12), and the index, pool and seed parts of G10 (3.14 to 3.16).
+Fixed: G1 (raced duplicate SKU now 409), G4 (one not-found helper), G6 (search, step 3.8), G7 (Testcontainers tests, 3.10), G8 (Swagger, 3.11), G9 (frontend connected, 3.12), and the index, pool and seed parts of G10 (3.14 to 3.16), and G17 (stampede protection, step 4.9).
 
 | # | Gap | Effect today | Fix |
 |---|---|---|---|
@@ -505,20 +525,18 @@ Fixed: G1 (raced duplicate SKU now 409), G4 (one not-found helper), G6 (search, 
 | G11 | `catalog-service` parent is Spring's starter, not `auramart-parent` | Versions are not shared with other modules | Align the parent POM |
 | G12 | Short words with a dropped letter miss: `sonra` does not find "Sonora" (score 0.55, threshold 0.6) | Some typos return nothing | Lower `pg_trgm.word_similarity_threshold` for the search, and measure the extra noise |
 | G13 | A search term that matches tens of thousands of rows is slow: `hedphones` takes 286 ms per query on 1M generated rows, 645 ms per request (page + count) | The first search for a term is slow; repeats come from the cache in about 5 ms | GiST trigram index with `<<->` distance ordering, so Postgres reads only the top matches; consider an estimated count |
-| G14 | While Redis is down, every request waits for the Redis timeouts (500 ms get + 500 ms put) | About 1 s extra per request; correct answers, but slow under load | Circuit breaker around the cache (Resilience4j), so Redis is skipped after a few failures |
+| G14 | While Redis is down, every request waits for one Redis timeout (500 ms) | About 0.5 s extra per request; correct answers, but slow under load | Circuit breaker around the cache (Resilience4j), so Redis is skipped after a few failures |
 | G15 | Cache-aside race: a reader that read the old row just before a write commits can store it just after the evict | Rare stale data, up to 12 minutes | Delayed second evict, or versioned entries; step 4.11 (evict on `ProductUpdated` events) narrows it |
 | G16 | An evict that fails while Redis is down is lost, and Redis keeps old entries across a restart (AOF) | After an outage, changes made during it can show old data for up to 12 minutes | Evict from the `ProductUpdated` event with retries (step 4.11), or flush the catalog keys when Redis comes back |
-| G17 | No stampede protection (step 4.9): many requests missing the same key at once all query the database | A popular page expiring under heavy load sends a burst of identical queries | Per-key lock with `SET NX` on a miss; the others wait briefly and read the cache |
 
 ---
 
 ## 13. Next steps, in order
 
-1. Commit and merge the Redis cache (steps 4.1–4.4, 4.8, 4.10, 4.13; tests green).
-2. Step 4.9: stampede protection with a per-key `SET NX` lock (G17).
-3. Steps 4.5–4.7: product images in S3 with pre-signed URLs, LocalStack for local work. Needs your own AWS free-tier account and an IAM user.
-4. Step 4.12: Caffeine local cache for categories, once there is a categories endpoint.
-5. Step 4.11 waits for Kafka (Phase 7). Step 1.5 then 3.13 (read replica) can be done any time.
-6. Optional tuning: G12 to G16.
+1. Commit and merge step 4.9 (stampede protection; tests green).
+2. Steps 4.6–4.7: product images in S3 with pre-signed URLs, built against LocalStack. Step 4.5 (a real AWS account and an IAM user) is needed only to run it on AWS.
+3. Step 4.12: Caffeine local cache for categories, with a categories endpoint.
+4. Step 4.11 waits for Kafka (Phase 7). Step 1.5 then 3.13 (read replica) can be done any time.
+5. Optional tuning: G12 to G16.
 
 Each later service follows the same pattern: contract, migration, entity, DTOs, mapper, repository, service, controller, tests, then documentation like this one.

@@ -68,7 +68,7 @@ flowchart TD
     P0[Phase 0 setup ✅] --> P1[Phase 1 infrastructure ✅ partial]
     P1 --> P2[Phase 2 common-lib ✅ mostly]
     P2 --> P3[Phase 3 catalog ✅ CRUD, search, tests · ⬜ read replica]
-    P3 --> P4[Phase 4 caching 🟡 Redis cache · ⬜ stampede lock, images in S3]
+    P3 --> P4[Phase 4 caching ✅ Redis cache · 🟡 stampede lock · ⬜ images in S3]
     P4 --> P5[Phase 5 auth and gateway ⬜]
     P5 --> P6[Phase 6 inventory and orders ⬜]
     P6 --> P7[Phase 7 Kafka saga ⬜]
@@ -346,6 +346,12 @@ sequenceDiagram
 - **What:** a Redis installed natively on Windows listened on `127.0.0.1:6379`. Docker publishes on `0.0.0.0:6379`, and `localhost` reached the native one first, so the app silently used the wrong Redis.
 - **Fix:** publish project containers on unusual host ports (Postgres 5435, Redis 6380).
 - **Check:** `netstat -ano | findstr :6379` shows every process listening on a port.
+
+### 3.35 Stampede protection (single flight) 🟡
+- **What:** when many requests miss the same cache key at once, only one loads it. It takes a lock in Redis (`SET lockKey token NX PX 3000`: set only if absent, expire after 3 s), loads, stores the value, then releases the lock. The others wait until the lock is gone and read the cache.
+- **Why:** a popular entry expiring under load would otherwise send hundreds of identical queries to the database at the same moment. Measured: 50 identical searches at once on 1M products, one database query.
+- **Where:** `cache/SingleFlightRedisCache`, used by every `@Cacheable(sync = true)`.
+- **Mistakes to avoid:** a lock without an expiry (a crashed pod blocks the key forever); deleting a lock without checking it is still yours (after an expiry, someone else may own it, hence the Lua compare-and-delete); releasing the lock before storing the value (waiters would find the lock gone and nothing to read); trusting a concurrency test that never failed (switch the lock off once and watch the test fail).
 
 ---
 
