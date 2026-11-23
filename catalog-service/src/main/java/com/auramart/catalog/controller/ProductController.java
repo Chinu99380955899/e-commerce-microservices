@@ -14,12 +14,15 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -34,6 +37,7 @@ public class ProductController {
     /** The only fields a client may sort by. Anything else is rejected, so no slow arbitrary sorts. */
     private static final Set<String> SORT_FIELDS = Set.of("name", "price", "createdAt");
     private static final int MAX_PAGE_SIZE = 100;
+    private static final int MAX_QUERY_LENGTH = 100;
 
     private final ProductService service;
 
@@ -43,13 +47,24 @@ public class ProductController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size,
             @RequestParam(defaultValue = "name,asc") String sort) {
-        if (page < 0) {
-            throw invalid("page must be 0 or more");
-        }
-        if (size < 1 || size > MAX_PAGE_SIZE) {
-            throw invalid("size must be between 1 and " + MAX_PAGE_SIZE);
-        }
+        checkPage(page, size);
         return service.list(category, PageRequest.of(page, size, parseSort(sort)));
+    }
+
+    /** Typo-tolerant search on the name. Results are ordered by relevance, so there is no sort parameter. */
+    @GetMapping("/search")
+    public PagedResponse<ProductResponse> search(
+            @RequestParam(required = false) String q,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        if (q == null || q.isBlank()) {
+            throw invalid("q must not be blank");
+        }
+        if (q.length() > MAX_QUERY_LENGTH) {
+            throw invalid("q must be at most " + MAX_QUERY_LENGTH + " characters");
+        }
+        checkPage(page, size);
+        return service.search(q, PageRequest.of(page, size));
     }
 
     @PostMapping
@@ -65,6 +80,17 @@ public class ProductController {
         return service.getActive(id);
     }
 
+    @PutMapping("/{id}")
+    public ProductResponse update(@PathVariable UUID id, @Valid @RequestBody ProductRequest request) {
+        return service.update(id, request);
+    }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void delete(@PathVariable UUID id) {
+        service.delete(id);
+    }
+
     /** Turns "price,desc" into a Sort, checking the field and direction first. */
     private static Sort parseSort(String raw) {
         String[] parts = raw.split(",");
@@ -74,6 +100,15 @@ public class ProductController {
             throw invalid("sort must be one of name,asc, price,asc, price,desc, createdAt,desc");
         }
         return direction.equals("desc") ? Sort.by(field).descending() : Sort.by(field).ascending();
+    }
+
+    private static void checkPage(int page, int size) {
+        if (page < 0) {
+            throw invalid("page must be 0 or more");
+        }
+        if (size < 1 || size > MAX_PAGE_SIZE) {
+            throw invalid("size must be between 1 and " + MAX_PAGE_SIZE);
+        }
     }
 
     private static BusinessException invalid(String detail) {

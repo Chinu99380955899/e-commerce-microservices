@@ -25,6 +25,20 @@ public class ProductMapper {
         return product;
     }
 
+    /**
+     * Copies the editable fields onto an existing product.
+     * The SKU is deliberately not copied: a product's SKU never changes.
+     */
+    public void applyUpdate(ProductRequest request, Product product) {
+        product.setName(request.name());
+        product.setDescription(request.description());
+        product.setCategory(request.category().toLowerCase());
+        product.setBrand(request.brand());
+        product.setPrice(request.price());
+        product.setCurrency(request.currency().toUpperCase());
+        product.setStockQuantity(request.stockQuantity());
+    }
+
     public ProductResponse toResponse(Product product) {
         return new ProductResponse(
                 product.getId(),
