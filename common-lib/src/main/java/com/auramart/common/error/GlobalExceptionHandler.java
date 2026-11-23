@@ -8,6 +8,7 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
@@ -37,6 +38,19 @@ public class GlobalExceptionHandler {
         problem.setType(URI.create(PROBLEM_BASE + "validation-error"));
         problem.setTitle("Validation failed");
         problem.setProperty("errors", errors);
+        return problem;
+    }
+
+    /**
+     * Two saves raced on the same row: the @Version check in the database rejected the older one.
+     * This is the same conflict as a stale expectedUpdatedAt, so the client gets the same answer.
+     */
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    public ProblemDetail handleOptimisticLock(OptimisticLockingFailureException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT,
+                "This product was changed by someone else. Reload to see the latest version.");
+        problem.setType(URI.create(PROBLEM_BASE + "concurrent-update"));
+        problem.setTitle("Concurrent update");
         return problem;
     }
 

@@ -8,10 +8,14 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import java.math.BigDecimal;
+import java.time.Instant;
 
 /**
  * What the client sends to create or update a product.
  * The rules here match the messages in API_CONTRACT.md.
+ *
+ * expectedUpdatedAt is optional and only used by PUT: it is the updatedAt the client last read.
+ * If the product changed since, the update is refused with 409 concurrent-update.
  */
 public record ProductRequest(
         @NotBlank @Size(max = 64) @Pattern(regexp = "^[A-Z0-9-]+$") String sku,
@@ -21,6 +25,7 @@ public record ProductRequest(
         @Size(max = 80) String brand,
         @NotNull @DecimalMin("0.00") @Digits(integer = 10, fraction = 2) BigDecimal price,
         @NotBlank @Pattern(regexp = "^[A-Za-z]{3}$") String currency,
-        @NotNull @Min(0) Integer stockQuantity
+        @NotNull @Min(0) Integer stockQuantity,
+        Instant expectedUpdatedAt
 ) {
 }
