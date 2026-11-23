@@ -52,7 +52,9 @@ services:
     image: redis:7.4
     command: ["redis-server", "--appendonly", "yes"]   # save data to disk too
     ports:
-      - "6379:6379"
+      # Host port 6380, not 6379: a Redis installed natively on Windows listens on 127.0.0.1:6379,
+      # and "localhost:6379" reached that one instead of this container (same reason Postgres uses 5435).
+      - "6380:6379"
     volumes:
       - redis-data:/data
     healthcheck:

@@ -1,5 +1,6 @@
 package com.auramart.catalog.service;
 
+import com.auramart.catalog.cache.CacheKeys;
 import com.auramart.catalog.domain.Product;
 import com.auramart.catalog.dto.PagedResponse;
 import com.auramart.catalog.dto.ProductRequest;
@@ -10,6 +11,9 @@ import com.auramart.common.error.BusinessException;
 import java.time.Instant;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -30,7 +34,14 @@ public class ProductService {
 
     private final ProductRepository repository;
     private final ProductMapper mapper;
+    private final ProductLookup lookup;
 
+    /**
+     * A new product can appear on any list or search page, so all cached pages are dropped.
+     * Clearing every page on each write is simple and always correct; it only hurts the hit rate
+     * if products are written very often, which a catalogue is not.
+     */
+    @CacheEvict(cacheNames = {CacheKeys.PRODUCT_LIST, CacheKeys.PRODUCT_SEARCH}, allEntries = true)
     @Transactional
     public ProductResponse create(ProductRequest request) {
         if (repository.existsBySku(request.sku())) {
@@ -58,7 +69,11 @@ public class ProductService {
     /**
      * Updates an active product. If the client sent expectedUpdatedAt and the product changed since,
      * the update is refused. The version check in the database is a second safety net.
+     * On success the cached product and every cached page are evicted (after the commit).
      */
+    @Caching(evict = {
+            @CacheEvict(cacheNames = CacheKeys.PRODUCT, key = "#id"),
+            @CacheEvict(cacheNames = {CacheKeys.PRODUCT_LIST, CacheKeys.PRODUCT_SEARCH}, allEntries = true)})
     @Transactional
     public ProductResponse update(UUID id, ProductRequest request) {
         Product product = repository.findByIdAndActiveTrue(id)
@@ -76,6 +91,9 @@ public class ProductService {
     }
 
     /** Soft delete: the product is hidden from lists and lookups, but the row is kept. */
+    @Caching(evict = {
+            @CacheEvict(cacheNames = CacheKeys.PRODUCT, key = "#id"),
+            @CacheEvict(cacheNames = {CacheKeys.PRODUCT_LIST, CacheKeys.PRODUCT_SEARCH}, allEntries = true)})
     @Transactional
     public void delete(UUID id) {
         Product product = repository.findByIdAndActiveTrue(id)
@@ -84,11 +102,9 @@ public class ProductService {
         product.setUpdatedAt(Instant.now());
     }
 
-    @Transactional(readOnly = true)
+    /** No @Transactional here: on a cache hit no database connection is needed at all. */
     public ProductResponse getActive(UUID id) {
-        Product product = repository.findByIdAndActiveTrue(id)
-                .orElseThrow(() -> productNotFound(id));
-        return mapper.toResponse(product);
+        return lookup.findActive(id).orElseThrow(() -> productNotFound(id));
     }
 
     private static BusinessException productNotFound(UUID id) {
@@ -106,6 +122,8 @@ public class ProductService {
      * One page of active products, optionally filtered by category.
      * The category is normalised the same way it is stored (lower case).
      */
+    @Cacheable(cacheNames = CacheKeys.PRODUCT_LIST,
+            key = "T(com.auramart.catalog.cache.CacheKeys).list(#category, #pageable)")
     @Transactional(readOnly = true)
     public PagedResponse<ProductResponse> list(String category, Pageable pageable) {
         Page<Product> page = (category == null || category.isBlank())
@@ -118,6 +136,8 @@ public class ProductService {
      * Typo-tolerant name search, best match first. The query must already be checked as not blank.
      * LIKE wildcards typed by the user (% and _) are escaped, so "%" cannot match every product.
      */
+    @Cacheable(cacheNames = CacheKeys.PRODUCT_SEARCH,
+            key = "T(com.auramart.catalog.cache.CacheKeys).search(#query, #pageable)")
     @Transactional(readOnly = true)
     public PagedResponse<ProductResponse> search(String query, Pageable pageable) {
         String q = query.trim();
